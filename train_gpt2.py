@@ -84,6 +84,8 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(q)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
+
+        # FlashAttention
         y = F.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True
         )
@@ -104,7 +106,7 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.gelu(x)
+        x = F.gelu(x, approximate="tanh")  # tanh approx is faster on GPU
         x = self.c_proj(x)
         return x
 
@@ -129,7 +131,7 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    vocab_size: int = 50257
+    vocab_size: int = 50304
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -183,8 +185,10 @@ class GPT(nn.Module):
         return logits, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # Use fused AdamW for better performance (single kernel instead of separate ops)
         optimizer = torch.optim.AdamW(
-            self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas
+            self.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=betas,
+            fused=True
         )
         return optimizer
 
@@ -267,14 +271,14 @@ class DistributedDataLoader:
         B = self.B
         T = self.T
         buf = self.tokens[self.current_position : self.current_position + B * T + 1]
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long).pin_memory()
         x = (buf[:-1]).view(B, T)  # inputs
         y = (buf[1:]).view(B, T)  # targets
         # advance current position and load next shard if necessary
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
-        return x.cuda(), y.cuda()
+        return x.cuda(non_blocking=True), y.cuda(non_blocking=True)
 
 
 # -----------------------------------------------------------------------------
@@ -436,7 +440,7 @@ if __name__ == "__main__":
     x, y = train_loader.next_batch()
 
     # init the model from scratch
-    num_vocab = 50257
+    num_vocab = 50304  # nice number for GPU (multiple of 128 for tensor cores)
     model_config = {
         "d12": GPTConfig(
             vocab_size=num_vocab, n_layer=12, n_head=12, n_embd=768
